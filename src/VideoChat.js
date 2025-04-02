@@ -32,7 +32,7 @@ const VideoChat = () => {
         setConnectionStatus("connecting");
         
         const newConnection = new signalR.HubConnectionBuilder()
-            .withUrl("chatappsaurabh.runasp.net/meetinghub", {
+            .withUrl("https://chatappsaurabh.runasp.net/meetinghub", {
                 transport: signalR.HttpTransportType.WebSockets,
                 skipNegotiation: true
             })
