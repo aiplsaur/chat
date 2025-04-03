@@ -16,6 +16,8 @@ const VideoChat = () => {
     const [selectedUser, setSelectedUser] = useState(null);
     const [chatType, setChatType] = useState("group"); // "group" or "private"
     const [receiverId, setReceiverId] = useState("");
+    const [userActivity, setUserActivity] = useState({}); // Track user activity timestamps
+    const [pingIntervalRef, setPingIntervalRef] = useState(null); // Store the ping interval
     
     // Video call state
     const [isInCall, setIsInCall] = useState(false);
@@ -32,12 +34,38 @@ const VideoChat = () => {
     useEffect(() => {
         let userId = sessionStorage.getItem("userId");
         if (!userId) {
-            userId = `User-${Math.floor(Math.random() * 10000)}`;
+            // Generate a unique ID that includes a device identifier
+            const randomId = Math.floor(Math.random() * 10000);
+            const deviceType = detectDeviceType();
+            userId = `User-${randomId}-${deviceType}`;
             sessionStorage.setItem("userId", userId);
         }
+        
+        // This will help track if we're a newly connected user
+        sessionStorage.setItem("isNewlyConnected", "true");
     }, []);
 
     const userId = sessionStorage.getItem("userId");
+
+    // Function to detect device type
+    const detectDeviceType = () => {
+        const ua = navigator.userAgent;
+        if (/(tablet|ipad|playbook|silk)|(android(?!.*mobi))/i.test(ua)) {
+            return "Tablet";
+        }
+        if (/Mobile|Android|iP(hone|od)|IEMobile|BlackBerry|Kindle|Silk-Accelerated|(hpw|web)OS|Opera M(obi|ini)/.test(ua)) {
+            return "Mobile";
+        }
+        return "Desktop";
+    };
+
+    // Function to normalize userId by removing device identifier for display
+    const getNormalizedUserId = (fullUserId) => {
+        if (!fullUserId) return "";
+        // Extract just the User-XXXX part without the device type
+        const match = fullUserId.match(/^(User-\d+)/);
+        return match ? match[1] : fullUserId;
+    };
 
     // Auto scroll to bottom of messages
     useEffect(() => {
@@ -45,91 +73,394 @@ const VideoChat = () => {
     }, [messages]);
 
     useEffect(() => {
-        setConnectionStatus("connecting");
-        
-        const newConnection = new signalR.HubConnectionBuilder()
-            .withUrl("https://chatappsaurabh.runasp.net/meetinghub", {
-                transport: signalR.HttpTransportType.WebSockets,
-                skipNegotiation: true
-            })
-            .configureLogging(signalR.LogLevel.Information)
-            .withAutomaticReconnect()
-            .build();
+        if (meetingId && !connection) {
+            const newConnection = new signalR.HubConnectionBuilder()
+                .withUrl(`https://chatappsaurabh.runasp.net/meetinghub`)
+                .withAutomaticReconnect()
+                .build();
 
-        newConnection
-            .start()
-            .then(() => {
-                console.log("Connected to SignalR Server as", userId);
-                setConnectionStatus("connected");
+            // Handle connection events
+            newConnection.onreconnecting(error => {
+                console.log('Connection lost, reconnecting...', error);
+                setConnectionStatus('Reconnecting...');
+            });
 
-                // Join the meeting/group
-                newConnection.invoke("JoinMeeting", meetingId, userId)
-                    .catch(err => {
-                        console.error("Error joining meeting:", err);
-                        setConnectionStatus("error");
+            newConnection.onreconnected(connectionId => {
+                console.log('Reconnected with connection ID:', connectionId);
+                setConnectionStatus('Connected');
+                
+                // After reconnection, try to rejoin the meeting and announce presence
+                setTimeout(() => {
+                    newConnection.invoke("JoinMeeting", meetingId, userId)
+                        .then(() => {
+                            console.log("Successfully rejoined meeting after reconnection");
+                            
+                            // Ensure we're in the user list
+                            setUsers(prevUsers => {
+                                if (!prevUsers.includes(userId)) {
+                                    return [...prevUsers, userId];
+                                }
+                                return prevUsers;
+                            });
+                            
+                            // Broadcast presence multiple times to ensure visibility
+                            setTimeout(() => announcePresence(newConnection), 500);
+                            
+                            // Request an updated user list
+                            setTimeout(() => refreshUserList(newConnection, meetingId), 1000);
+                        })
+                        .catch(err => {
+                            console.error("Failed to rejoin meeting after reconnection:", err);
+                        });
+                }, 500);
+            });
+
+            newConnection.onclose(error => {
+                console.log('Connection closed', error);
+                setConnectionStatus('Disconnected');
+            });
+
+            // Handle a user joining the meeting
+            newConnection.on("UserJoined", (userIdParam) => {
+                console.log(`User joined: ${userIdParam}`);
+                
+                // Broadcast our presence to the new user after a brief delay
+                setTimeout(() => {
+                    try {
+                        if (newConnection && newConnection.state === "connected") {
+                            newConnection.invoke("SendGroupMessage", meetingId, "__USER_PRESENCE__", userId)
+                                .catch(err => console.log("Presence broadcast to new user failed:", err));
+                        }
+                    } catch (err) {
+                        console.log("Error broadcasting presence to new user:", err);
+                    }
+                }, 300);
+                
+                // Request an updated user list after a new user joins (with a delay)
+                setTimeout(() => {
+                    try {
+                        if (newConnection && newConnection.state === "connected") {
+                            newConnection.invoke("GetConnectedUsers", meetingId)
+                                .then(connectedUsers => {
+                                    if (Array.isArray(connectedUsers)) {
+                                        setUsers(connectedUsers);
+                                    }
+                                })
+                                .catch(err => {
+                                    console.log("Error getting updated user list:", err);
+                                    newConnection.invoke("RequestUserList", meetingId, userId)
+                                        .catch(e => console.log("RequestUserList fallback failed:", e));
+                                });
+                        }
+                    } catch (err) {
+                        console.log("Error refreshing user list after user joined:", err);
+                    }
+                }, 1000);
+                
+                // Check if this user is already in our list (case-insensitive)
+                const normalizedNewUserId = userIdParam.trim().toLowerCase();
+                const isNewUser = !users.some(u => u.trim().toLowerCase() === normalizedNewUserId);
+                
+                // Add the user to our list if they're not already there
+                if (isNewUser) {
+                    setUsers(prevUsers => [...prevUsers, userIdParam]);
+                    
+                    // Add a system message for genuinely new users
+                    setMessages(prevMessages => [
+                        ...prevMessages,
+                        {
+                            type: "system",
+                            msg: `${userIdParam} has joined the chat`,
+                            timestamp: new Date()
+                        }
+                    ]);
+                }
+                
+                // Update the user's activity time
+                setUserActivity(prev => ({
+                    ...prev,
+                    [userIdParam]: Date.now()
+                }));
+            });
+
+            // Handle receiving the complete user list
+            newConnection.on("UserList", (userList) => {
+                console.log("Received complete user list:", userList);
+                
+                if (Array.isArray(userList)) {
+                    // Ensure we are also in the list
+                    if (!userList.some(u => u.trim().toLowerCase() === userId.trim().toLowerCase())) {
+                        userList.push(userId);
+                    }
+                    
+                    // Update the users state
+                    setUsers(userList);
+                    
+                    // Update activity timestamps for all users
+                    const activityUpdates = {};
+                    userList.forEach(uid => {
+                        activityUpdates[uid] = Date.now();
                     });
+                    
+                    setUserActivity(prev => ({
+                        ...prev,
+                        ...activityUpdates
+                    }));
+                }
+            });
 
-                // Group message handler
-                newConnection.on("ReceiveGroupMessage", (msg, sender) => {
+            // Handle a user leaving the meeting
+            newConnection.on("UserLeft", (leftUserId) => {
+                console.log(`User left: ${leftUserId}`);
+                
+                // Check if this user has other active connections with similar IDs
+                // Some users might have multiple connections with slight variations
+                const normalizedLeftUserId = leftUserId.trim().toLowerCase();
+                
+                setUsers(prevUsers => {
+                    // Find other possible connections from the same user (case insensitive)
+                    const otherConnectionsFromSameUser = prevUsers.filter(id => 
+                        id !== leftUserId && id.trim().toLowerCase() === normalizedLeftUserId
+                    );
+                    
+                    // Only send a system message if this was their last connection
+                    if (otherConnectionsFromSameUser.length === 0) {
+                        setMessages(prev => [...prev, {
+                            type: "system",
+                            msg: `${leftUserId} has left the chat`,
+                            timestamp: new Date()
+                        }]);
+                    }
+                    
+                    // Remove this specific user ID from the list
+                    return prevUsers.filter(id => id !== leftUserId);
+                });
+                
+                // Remove user from activity tracking
+                setUserActivity(prev => {
+                    const newActivity = { ...prev };
+                    delete newActivity[leftUserId];
+                    return newActivity;
+                });
+                
+                // If this was the selected user for private chat, switch back to group chat
+                if (selectedUser === leftUserId) {
+                    setSelectedUser(null);
+                    setMessages(prev => [...prev, {
+                        type: "system",
+                        msg: `Switched to group chat because ${leftUserId} left`,
+                        timestamp: new Date()
+                    }]);
+                }
+            });
+
+            // Handle group messages, including special presence messages
+            newConnection.on("ReceiveGroupMessage", (msg, sender) => {
+                // Check if this is a special presence message
+                if (msg === "__USER_PRESENCE__") {
+                    console.log(`Received presence broadcast from: ${sender}`);
+                    
+                    // Update user activity timestamp
+                    setUserActivity(prev => ({
+                        ...prev,
+                        [sender]: Date.now()
+                    }));
+                    
+                    // Add user to the list if not already there
+                    const normalizedSenderId = sender.trim().toLowerCase();
+                    setUsers(prevUsers => {
+                        // Check if the user exists (case-insensitive)
+                        if (!prevUsers.some(u => u.trim().toLowerCase() === normalizedSenderId)) {
+                            console.log(`Adding user from presence message: ${sender}`);
+                            return [...prevUsers, sender];
+                        }
+                        return prevUsers;
+                    });
+                } else {
+                    // Regular group message, add to messages
                     setMessages(prevMessages => [...prevMessages, { 
                         type: "group",
                         sender, 
                         msg, 
-                        timestamp: new Date(),
-                        meetingId 
+                        timestamp: new Date()
                     }]);
-                });
+                }
+            });
 
-                // Private message handler
-                newConnection.on("ReceivePrivateMessage", (msg, sender) => {
-                    setMessages(prevMessages => [...prevMessages, { 
-                        type: "private",
-                        sender, 
-                        msg, 
-                        timestamp: new Date(),
-                        recipientId: userId
-                    }]);
+            // Handle private messages
+            newConnection.on("ReceivePrivateMessage", (msg, sender) => {
+                console.log(`Received private message from ${sender}`);
+                
+                // Add the message to our list
+                setMessages(prevMessages => [...prevMessages, { 
+                    type: "private",
+                    sender, 
+                    msg, 
+                    timestamp: new Date(),
+                    isIncoming: true
+                }]);
+                
+                // Update the sender's activity time
+                setUserActivity(prev => ({
+                    ...prev,
+                    [sender]: Date.now()
+                }));
+                
+                // Add the sender to our users list if they're not already there
+                setUsers(prevUsers => {
+                    if (!prevUsers.includes(sender)) {
+                        return [...prevUsers, sender];
+                    }
+                    return prevUsers;
                 });
+            });
 
-                // User joined handler
-                newConnection.on("UserJoined", (newUserId) => {
+            // WebRTC signaling handlers
+            newConnection.on("ReceiveOffer", (offer, senderId) => {
+                handleIncomingOffer(offer, senderId);
+            });
+
+            newConnection.on("ReceiveAnswer", (answer, senderId) => {
+                handleIncomingAnswer(answer, senderId);
+            });
+
+            newConnection.on("ReceiveIceCandidate", (candidate, senderId) => {
+                handleIncomingIceCandidate(candidate, senderId);
+            });
+
+            setConnection(newConnection);
+
+            newConnection.start()
+                .then(() => {
+                    console.log('Connection started');
+                    setConnectionStatus('Connected');
+                    
+                    // Mark ourselves as newly connected for special handling
+                    sessionStorage.setItem('isNewlyConnected', 'true');
+                    
+                    // Join the meeting after connection is established
+                    return newConnection.invoke("JoinMeeting", meetingId, userId);
+                })
+                .then(() => {
+                    console.log("Successfully joined meeting:", meetingId);
+                    
+                    // First, make sure we add ourselves to the user list immediately
+                    // This ensures the "Online Users" section is never empty
                     setUsers(prevUsers => {
-                        if (!prevUsers.includes(newUserId)) {
-                            return [...prevUsers, newUserId];
+                        const normalizedUserId = userId.trim().toLowerCase();
+                        if (!prevUsers.some(u => u.trim().toLowerCase() === normalizedUserId)) {
+                            return [...prevUsers, userId];
                         }
                         return prevUsers;
                     });
+                    
+                    // Store our activity time
+                    setUserActivity(prev => ({
+                        ...prev,
+                        [userId]: Date.now()
+                    }));
+                    
+                    // Send a presence message after a brief delay
+                    setTimeout(() => {
+                        try {
+                            newConnection.invoke("SendGroupMessage", meetingId, "__USER_PRESENCE__", userId)
+                                .catch(err => console.log("Initial presence broadcast failed:", err));
+                        } catch (err) {
+                            console.log("Error in initial presence broadcast:", err);
+                        }
+                    }, 200);
+                    
+                    // Request the full list of connected users after joining
+                    setTimeout(() => refreshUserList(newConnection, meetingId), 500);
+                    
+                    // Announce presence with multiple attempts after a slightly longer delay
+                    setTimeout(() => announcePresence(newConnection), 1000);
+                    
+                    // Set up ping interval to maintain connection and check for inactive users
+                    const pingInterval = setInterval(() => {
+                        if (newConnection && newConnection.state === "connected") {
+                            // Update our own activity time
+                            setUserActivity(prev => ({
+                                ...prev, 
+                                [userId]: Date.now()
+                            }));
+                            
+                            // Every 30 seconds, check for inactive users and clean them up
+                            const now = Date.now();
+                            setUserActivity(prev => {
+                                const activeUsers = { ...prev };
+                                let inactiveFound = false;
+                                
+                                // Remove users inactive for more than 2 minutes
+                                Object.keys(activeUsers).forEach(uid => {
+                                    if (now - activeUsers[uid] > 120000) { // 2 minutes
+                                        delete activeUsers[uid];
+                                        inactiveFound = true;
+                                    }
+                                });
+                                
+                                // If we removed inactive users, update the user list
+                                if (inactiveFound) {
+                                    setUsers(currentUsers => 
+                                        currentUsers.filter(u => 
+                                            Object.keys(activeUsers).some(
+                                                aid => aid.trim().toLowerCase() === u.trim().toLowerCase()
+                                            )
+                                        )
+                                    );
+                                }
+                                
+                                return activeUsers;
+                            });
+                            
+                            // Request updated user list if we have active users
+                            if (users.length > 0) {
+                                newConnection.invoke("RequestUserList", meetingId, userId)
+                                    .catch(err => {
+                                        if (!err.toString().includes("No such method") && 
+                                            !err.toString().includes("not found")) {
+                                            console.log("Ping RequestUserList error:", err);
+                                        }
+                                    });
+                            }
+                            
+                            // Every 2 minutes, broadcast presence to maintain visibility
+                            const lastBroadcast = sessionStorage.getItem('lastPresenceBroadcast');
+                            if (!lastBroadcast || (now - parseInt(lastBroadcast, 10)) > 120000) {
+                                try {
+                                    newConnection.invoke("SendGroupMessage", meetingId, "__USER_PRESENCE__", userId)
+                                        .then(() => {
+                                            sessionStorage.setItem('lastPresenceBroadcast', now.toString());
+                                        })
+                                        .catch(err => {
+                                            console.log("Periodic presence broadcast failed:", err);
+                                        });
+                                } catch (err) {
+                                    console.log("Error in periodic presence broadcast:", err);
+                                }
+                            }
+                        }
+                    }, 30000); // 30 seconds
+                    
+                    // Clear interval on unmount
+                    setPingIntervalRef(pingInterval);
+                })
+                .catch((err) => {
+                    console.error('Connection failed:', err);
+                    setConnectionStatus('Connection failed');
                 });
-
-                // User left handler
-                newConnection.on("UserLeft", (leftUserId) => {
-                    setUsers(prevUsers => prevUsers.filter(id => id !== leftUserId));
-                });
-
-                // WebRTC signaling handlers
-                newConnection.on("ReceiveOffer", (offer, senderId) => {
-                    handleIncomingOffer(offer, senderId);
-                });
-
-                newConnection.on("ReceiveAnswer", (answer, senderId) => {
-                    handleIncomingAnswer(answer, senderId);
-                });
-
-                newConnection.on("ReceiveIceCandidate", (candidate, senderId) => {
-                    handleIncomingIceCandidate(candidate, senderId);
-                });
-            })
-            .catch(err => {
-                console.error("SignalR Connection Error:", err);
-                setConnectionStatus("error");
-            });
-
-        setConnection(newConnection);
+        }
 
         return () => {
-            if (newConnection) newConnection.stop();
+            if (connection) {
+                connection.stop();
+            }
+            if (pingIntervalRef) {
+                clearInterval(pingIntervalRef);
+                setPingIntervalRef(null);
+            }
         };
-    }, []);
+    }, [meetingId, userId, users, selectedUser]);
 
     // WebRTC helper functions
     const handleIncomingOffer = async (offer, senderId) => {
@@ -335,12 +666,38 @@ const VideoChat = () => {
         }
     };
 
+    // Helper for UI
+    const handleUserSelect = (userId) => {
+        setSelectedUser(userId);
+        setChatType("private");
+    };
+    
+    const switchToGroupChat = () => {
+        setSelectedUser(null);
+        setChatType("group");
+    };
+    
+    // For display in chat header
+    const getDisplayName = (userId) => {
+        return getNormalizedUserId(userId);
+    };
+
+    const endCall = () => {
+        // End all peer connections
+        Object.keys(peerConnections).forEach(peerId => {
+            handleCallEnd(peerId);
+        });
+    };
+
     const sendMessage = async () => {
         if (connection && message.trim()) {
             try {
                 if (chatType === "private" && selectedUser) {
                     // Send private message
+                    console.log("Sending private message to:", selectedUser, "Content:", message);
                     await connection.invoke("SendPrivateMessage", selectedUser, message, userId);
+                    
+                    // Add to local messages - this ensures we see our own messages in the chat
                     setMessages(prevMessages => [
                         ...prevMessages, 
                         { 
@@ -348,7 +705,8 @@ const VideoChat = () => {
                             sender: userId, 
                             msg: message, 
                             timestamp: new Date(),
-                            recipientId: selectedUser
+                            recipientId: selectedUser,
+                            isOutgoing: true // Mark as outgoing for reference
                         }
                     ]);
                 } else {
@@ -358,6 +716,8 @@ const VideoChat = () => {
                 setMessage("");
             } catch (err) {
                 console.error("Error sending message:", err);
+                // Show error to user
+                alert(`Failed to send message: ${err.toString()}`);
             }
         }
     };
@@ -402,27 +762,192 @@ const VideoChat = () => {
         }
     };
 
-    // Helper for UI
-    const handleUserSelect = (userId) => {
-        setSelectedUser(userId);
-        setChatType("private");
-    };
-    
-    const switchToGroupChat = () => {
-        setSelectedUser(null);
-        setChatType("group");
-    };
-    
-    const endCall = () => {
-        // End all peer connections
-        Object.keys(peerConnections).forEach(peerId => {
-            handleCallEnd(peerId);
-        });
-    };
-
     // Format timestamp
     const formatTime = (date) => {
         return new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    };
+
+    // Function to announce our presence to all users in the meeting
+    const announcePresence = (conn = connection) => {
+        if (!conn || conn.state !== "connected") return;
+        
+        console.log("Announcing presence to all users");
+        
+        // Send a special announcement message
+        setMessages(prev => [...prev, {
+            type: "system",
+            msg: "Broadcasting your presence to all users...",
+            timestamp: new Date()
+        }]);
+        
+        // Broadcast multiple times with increasing delays
+        [100, 500, 1500, 3000].forEach(delay => {
+            setTimeout(() => {
+                try {
+                    conn.invoke("SendGroupMessage", meetingId, "__USER_PRESENCE__", userId)
+                        .catch(err => console.log(`Presence broadcast failed (${delay}ms):`, err));
+                } catch (err) {
+                    console.log(`Error in presence broadcast (${delay}ms):`, err);
+                }
+            }, delay);
+        });
+        
+        // After the last broadcast, confirm to the user
+        setTimeout(() => {
+            setMessages(prev => [...prev, {
+                type: "system",
+                msg: "Presence broadcast complete",
+                timestamp: new Date()
+            }]);
+        }, 3500);
+    };
+
+    // Function to refresh user list from server with multiple approaches
+    const refreshUserList = (conn, meetingIdParam) => {
+        if (!conn || conn.state !== "connected") return;
+        
+        console.log("Refreshing user list for meeting:", meetingIdParam);
+        
+        // First, make sure we add ourselves to the list
+        setUsers(prevUsers => {
+            if (!prevUsers.includes(userId)) {
+                return [...prevUsers, userId];
+            }
+            return prevUsers;
+        });
+        
+        // Try multiple methods to get the user list
+        const attemptMethods = [
+            // Method 1: GetConnectedUsers API
+            () => {
+                return conn.invoke("GetConnectedUsers", meetingIdParam)
+                    .then((connectedUsers) => {
+                        if (Array.isArray(connectedUsers) && connectedUsers.length > 0) {
+                            console.log("User list from GetConnectedUsers:", connectedUsers);
+                            // Update the users list with the server's list
+                            setUsers(connectedUsers);
+                            return true;
+                        }
+                        return false;
+                    })
+                    .catch(err => {
+                        console.log("GetConnectedUsers failed:", err);
+                        return false;
+                    });
+            },
+            
+            // Method 2: RequestUserList API
+            () => {
+                return conn.invoke("RequestUserList", meetingIdParam, userId)
+                    .then(() => {
+                        console.log("RequestUserList sent");
+                        return false; // Success but we don't get immediate response
+                    })
+                    .catch(err => {
+                        console.log("RequestUserList failed:", err);
+                        return false;
+                    });
+            },
+            
+            // Method 3: Broadcast presence message
+            () => {
+                return conn.invoke("SendGroupMessage", meetingIdParam, "__USER_PRESENCE__", userId)
+                    .then(() => {
+                        console.log("Presence broadcast sent");
+                        return false; // Success but we don't get immediate response
+                    })
+                    .catch(err => {
+                        console.log("Presence broadcast failed:", err);
+                        return false;
+                    });
+            }
+        ];
+        
+        // Try each method in sequence
+        const tryNextMethod = (index) => {
+            if (index >= attemptMethods.length) {
+                console.log("All refresh methods attempted");
+                return;
+            }
+            
+            attemptMethods[index]()
+                .then(success => {
+                    if (!success) {
+                        // Try the next method
+                        tryNextMethod(index + 1);
+                    }
+                })
+                .catch(() => {
+                    // Try the next method
+                    tryNextMethod(index + 1);
+                });
+        };
+        
+        // Start the sequence
+        tryNextMethod(0);
+    };
+
+    // Manual refresh function for user interaction
+    const handleRefreshUsers = () => {
+        if (connection && connection.state === "connected") {
+            setUsers([]); // Clear the list temporarily to show refresh is happening
+            
+            // Show a temporary status message
+            const statusMsg = {
+                type: "system",
+                msg: "Refreshing user list...",
+                timestamp: new Date()
+            };
+            
+            setMessages(prev => [...prev, statusMsg]);
+            
+            // Try multiple approaches to discover users
+            refreshUserList(connection, meetingId);
+            
+            // Then explicitly announce our presence
+            setTimeout(announcePresence, 500);
+            
+            // After a delay, try refreshing again and remove the status message
+            setTimeout(() => {
+                refreshUserList(connection, meetingId);
+                
+                // Add confirmation message
+                setMessages(prev => {
+                    // Filter out the temporary status message
+                    const filtered = prev.filter(m => m !== statusMsg);
+                    
+                    return [...filtered, {
+                        type: "system",
+                        msg: "User list refreshed.",
+                        timestamp: new Date()
+                    }];
+                });
+            }, 2000);
+        }
+    };
+
+    // Check if a user is active recently (last 2 minutes)
+    const isUserActive = (user) => {
+        const activityTime = userActivity[user];
+        if (!activityTime) return false;
+        
+        const now = Date.now();
+        const inactiveTimeout = 2 * 60 * 1000; // 2 minutes
+        return (now - activityTime) < inactiveTimeout;
+    };
+
+    // Get relative time for user activity
+    const getActivityTime = (user) => {
+        const activityTime = userActivity[user];
+        if (!activityTime) return "Unknown";
+        
+        const seconds = Math.floor((Date.now() - activityTime) / 1000);
+        
+        if (seconds < 60) return "Just now";
+        if (seconds < 120) return "1 minute ago";
+        if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes ago`;
+        if (seconds < 7200) return "1 hour ago";
+        return `${Math.floor(seconds / 3600)} hours ago`;
     };
 
     return (
@@ -433,8 +958,8 @@ const VideoChat = () => {
                 </h1>
                 <div className="flex items-center space-x-2">
                     <span className={`w-3 h-3 rounded-full ${
-                        connectionStatus === "connected" ? "bg-green-500" : 
-                        connectionStatus === "connecting" ? "bg-yellow-500" : 
+                        connectionStatus === "connected" ? "bg-green-500 animate-pulse" : 
+                        connectionStatus === "connecting" ? "bg-yellow-500 animate-pulse" : 
                         "bg-red-500"
                     }`}></span>
                     <span className="text-sm text-gray-600 dark:text-gray-300">
@@ -442,6 +967,42 @@ const VideoChat = () => {
                          connectionStatus === "connecting" ? "Connecting..." : 
                          "Connection Error"}
                     </span>
+                    {connectionStatus !== "connected" && (
+                        <button 
+                            onClick={() => {
+                                if (connection) {
+                                    setConnectionStatus("connecting");
+                                    
+                                    // Safe reconnection
+                                    const reconnect = async () => {
+                                        try {
+                                            if (connection.state !== "disconnected") {
+                                                await connection.stop();
+                                            }
+                                            
+                                            await connection.start();
+                                            console.log("Reconnected to server");
+                                            
+                                            await connection.invoke("JoinMeeting", meetingId, userId);
+                                            setConnectionStatus("connected");
+                                            
+                                            // Refresh user list
+                                            refreshUserList(connection, meetingId);
+                                        } catch (err) {
+                                            console.error("Manual reconnect failed:", err);
+                                            setConnectionStatus("error");
+                                        }
+                                    };
+                                    
+                                    // Use setTimeout to ensure UI updates before attempting reconnection
+                                    setTimeout(reconnect, 100);
+                                }
+                            }}
+                            className="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 px-2 py-1 bg-blue-50 dark:bg-blue-900/30 rounded"
+                        >
+                            Reconnect
+                        </button>
+                    )}
                 </div>
             </div>
             
@@ -567,7 +1128,7 @@ const VideoChat = () => {
                                 </svg>
                                 <span className="font-semibold text-gray-800 dark:text-white">
                                     {chatType === "private" && selectedUser 
-                                        ? `Chat with ${selectedUser}` 
+                                        ? `Chat with ${getDisplayName(selectedUser)}` 
                                         : "Group Chat"}
                                 </span>
                             </div>
@@ -607,46 +1168,85 @@ const VideoChat = () => {
                                     .filter(msg => {
                                         // Filter messages based on current chat type and selection
                                         if (chatType === "group") {
-                                            return msg.type === "group";
+                                            return msg.type === "group" || msg.type === "system";
                                         } else if (chatType === "private" && selectedUser) {
-                                            return (msg.type === "private" && 
-                                                  ((msg.sender === userId && msg.recipientId === selectedUser) || 
-                                                   (msg.sender === selectedUser && msg.recipientId === userId)));
+                                            // For private messages, we need to check for message direction
+                                            if (msg.type === "system") return false; // Don't show system messages in private chats
+                                            if (msg.type !== "private") return false;
+                                            
+                                            // Messages sent by current user to selected user
+                                            const isOutgoingToSelectedUser = 
+                                                msg.sender === userId && 
+                                                msg.recipientId === selectedUser;
+                                            
+                                            // Messages received from selected user
+                                            const isIncomingFromSelectedUser = 
+                                                msg.sender === selectedUser && 
+                                                msg.recipientId === userId;
+                                                
+                                            // Handle normalized IDs (in case the same user is on multiple devices)
+                                            const senderMatches = 
+                                                getNormalizedUserId(msg.sender) === getNormalizedUserId(selectedUser);
+                                            const recipientMatches = 
+                                                msg.recipientId && getNormalizedUserId(msg.recipientId) === getNormalizedUserId(userId);
+                                                
+                                            return isOutgoingToSelectedUser || 
+                                                   isIncomingFromSelectedUser || 
+                                                   (senderMatches && recipientMatches);
                                         }
-                                        return true;
+                                        return false; // Default: don't show anything if conditions aren't met
                                     })
                                     .map((msg, index) => (
                                         <div
                                             key={index}
-                                            className={`flex mb-3 ${msg.sender === userId ? "justify-end" : "justify-start"}`}
+                                            className={`flex mb-3 ${
+                                                msg.type === "system" 
+                                                    ? "justify-center" 
+                                                    : (msg.sender === userId ? "justify-end" : "justify-start")
+                                            }`}
                                         >
-                                            <div
-                                                className={`max-w-[80%] rounded-2xl shadow-sm px-4 py-3 ${
-                                                    msg.sender === userId
-                                                        ? "bg-gradient-to-r from-blue-500 to-purple-500 dark:from-blue-600 dark:to-purple-600 text-white rounded-tr-none"
-                                                        : "bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white rounded-tl-none"
-                                                }`}
-                                            >
-                                                <div className="flex items-center justify-between mb-1">
-                                                    <div className="font-semibold text-sm">
-                                                        {msg.sender === userId ? "You" : (
-                                                            <button 
-                                                                className="hover:underline"
-                                                                onClick={() => handleUserSelect(msg.sender)}
-                                                            >
-                                                                {msg.sender}
-                                                            </button>
-                                                        )}
-                                                        {msg.type === "private" && " (private)"}
-                                                    </div>
-                                                    {msg.timestamp && (
-                                                        <div className="text-xs opacity-75 ml-2">
-                                                            {formatTime(msg.timestamp)}
-                                                        </div>
-                                                    )}
+                                            {msg.type === "system" ? (
+                                                <div className="bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-300 px-4 py-1.5 rounded-full text-xs font-medium">
+                                                    {msg.msg}
                                                 </div>
-                                                <div className="break-words">{msg.msg}</div>
-                                            </div>
+                                            ) : (
+                                                <div
+                                                    className={`max-w-[80%] rounded-2xl shadow-sm px-4 py-3 ${
+                                                        msg.sender === userId
+                                                            ? "bg-gradient-to-r from-blue-500 to-purple-500 dark:from-blue-600 dark:to-purple-600 text-white rounded-tr-none"
+                                                            : "bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white rounded-tl-none"
+                                                    }`}
+                                                >
+                                                    <div className="flex items-center justify-between mb-1">
+                                                        <div className="font-semibold text-sm">
+                                                            {msg.sender === userId ? "You" : (
+                                                                <button 
+                                                                    className="hover:underline"
+                                                                    onClick={() => handleUserSelect(msg.sender)}
+                                                                >
+                                                                    {getNormalizedUserId(msg.sender)}
+                                                                </button>
+                                                            )}
+                                                            {msg.type === "private" && (
+                                                                <span className="ml-1 text-xs px-1.5 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200">
+                                                                    private
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        {msg.timestamp && (
+                                                            <div className="text-xs opacity-75 ml-2 flex items-center">
+                                                                {formatTime(msg.timestamp)}
+                                                                {msg.type === "private" && msg.sender === userId && (
+                                                                    <span className="ml-1" title={msg.isOutgoing ? "Message sent" : "Message delivered"}>
+                                                                        ✓
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                    <div className="break-words">{msg.msg}</div>
+                                                </div>
+                                            )}
                                         </div>
                                     ))
                             )}
@@ -664,7 +1264,7 @@ const VideoChat = () => {
                                     className="w-full p-4 pl-5 pr-12 border border-gray-200 dark:border-gray-700 rounded-full shadow-sm focus:border-blue-500 focus:ring focus:ring-blue-200 focus:ring-opacity-50 bg-white dark:bg-gray-800 text-gray-800 dark:text-white"
                                 />
                                 <div className="absolute left-4 top-0 transform -translate-y-1/2 px-2 text-xs font-medium rounded-full" style={{backgroundColor: chatType === "private" ? "#e879f9" : "#60a5fa", color: "white"}}>
-                                    {chatType === "private" && selectedUser ? `Private: ${selectedUser}` : "Group Chat"}
+                                    {chatType === "private" && selectedUser ? `Private: ${getDisplayName(selectedUser)}` : "Group Chat"}
                                 </div>
                                 {message.trim() && (
                                     <button 
@@ -685,7 +1285,25 @@ const VideoChat = () => {
                 <div className="lg:w-1/4 bg-white dark:bg-gray-800 rounded-xl p-4 border border-gray-200 dark:border-gray-700 shadow-md">
                     <div className="flex items-center justify-between mb-3">
                         <h3 className="font-semibold text-gray-800 dark:text-white">Online Users</h3>
-                        <div className="text-xs text-gray-500 dark:text-gray-400">{users.length} online</div>
+                        <div className="flex items-center gap-2">
+                            <button 
+                                onClick={handleRefreshUsers}
+                                className="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 flex items-center"
+                                title="Refresh user list"
+                            >
+                                <svg className={`w-3.5 h-3.5 mr-1 ${users.length === 0 ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                                Refresh
+                            </button>
+                            <div className="text-xs text-gray-500 dark:text-gray-400">
+                                {users.length === 0 ? (
+                                    <span className="animate-pulse">Searching...</span>
+                                ) : (
+                                    `${users.length} online`
+                                )}
+                            </div>
+                        </div>
                     </div>
                     
                     <div className="text-xs text-gray-500 dark:text-gray-400 mb-2 bg-blue-50 dark:bg-blue-900/30 p-2 rounded">
@@ -695,12 +1313,22 @@ const VideoChat = () => {
                     <div className="space-y-2 max-h-80 overflow-y-auto">
                         {users.length === 0 ? (
                             <div className="text-center text-gray-500 dark:text-gray-400 text-sm py-4">
-                                No other users online
+                                <div className="animate-pulse mb-2">Looking for users...</div>
+                                <button 
+                                    onClick={announcePresence}
+                                    className="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full"
+                                >
+                                    Broadcast Presence
+                                </button>
                             </div>
                         ) : (
                             users
                                 .filter(uId => uId !== userId)
-                                .map(user => (
+                                .map(user => {
+                                    // Normalize the user ID for display purposes
+                                    const displayName = getNormalizedUserId(user);
+                                    
+                                    return (
                                     <div 
                                         key={user} 
                                         className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition-colors ${
@@ -710,9 +1338,29 @@ const VideoChat = () => {
                                         }`}
                                         onClick={() => handleUserSelect(user)}
                                     >
-                                        <div className="flex items-center gap-2">
-                                            <div className="w-2 h-2 rounded-full bg-green-500"></div>
-                                            <span className="text-gray-800 dark:text-white">{user}</span>
+                                        <div className="flex flex-col">
+                                            <div className="flex items-center gap-2">
+                                                <div className={`w-2 h-2 rounded-full ${isUserActive(user) ? "bg-green-500" : "bg-gray-400"}`}></div>
+                                                <span className="text-gray-800 dark:text-white">{displayName}</span>
+                                                {user.includes("Mobile") && (
+                                                    <span className="text-xs bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 px-1.5 py-0.5 rounded-full">
+                                                        📱
+                                                    </span>
+                                                )}
+                                                {user.includes("Tablet") && (
+                                                    <span className="text-xs bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300 px-1.5 py-0.5 rounded-full">
+                                                        📟
+                                                    </span>
+                                                )}
+                                                {user.includes("Desktop") && (
+                                                    <span className="text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-1.5 py-0.5 rounded-full">
+                                                        💻
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <span className="text-xs text-gray-500 dark:text-gray-400 ml-4">
+                                                {getActivityTime(user)}
+                                            </span>
                                         </div>
                                         <div className="flex gap-1">
                                             <button 
@@ -721,6 +1369,7 @@ const VideoChat = () => {
                                                     handleUserSelect(user);
                                                 }}
                                                 className="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300"
+                                                title="Chat privately"
                                             >
                                                 <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
                                                     <path fillRule="evenodd" d="M18 10c0 3.866-3.582 7-8 7a8.841 8.841 0 01-4.083-.98L2 17l1.338-3.123C2.493 12.767 2 11.434 2 10c0-3.866 3.582-7 8-7s8 3.134 8 7zM7 9H5v2h2V9zm8 0h-2v2h2V9zM9 9h2v2H9V9z" clipRule="evenodd" />
@@ -733,6 +1382,7 @@ const VideoChat = () => {
                                                         startCall(user);
                                                     }}
                                                     className="text-green-600 dark:text-green-400 hover:text-green-800 dark:hover:text-green-300"
+                                                    title="Video call"
                                                 >
                                                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
                                                         <path d="M2 3a1 1 0 011-1h2.153a1 1 0 01.986.836l.74 4.435a1 1 0 01-.54 1.06l-1.548.773a11.037 11.037 0 006.105 6.105l.774-1.548a1 1 0 011.059-.54l4.435.74a1 1 0 01.836.986V17a1 1 0 01-1 1h-2C7.82 18 2 12.18 2 5V3z" />
@@ -741,7 +1391,8 @@ const VideoChat = () => {
                                             )}
                                         </div>
                                     </div>
-                                ))
+                                    );
+                                })
                         )}
                     </div>
                     
