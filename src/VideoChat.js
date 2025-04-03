@@ -118,17 +118,6 @@ const VideoChat = () => {
                 newConnection.on("ReceiveIceCandidate", (candidate, senderId) => {
                     handleIncomingIceCandidate(candidate, senderId);
                 });
-
-                // For backward compatibility 
-                newConnection.on("ReceiveSignal", (msg, sender) => {
-                    setMessages(prevMessages => [...prevMessages, { 
-                        type: "group",
-                        sender, 
-                        msg, 
-                        timestamp: new Date(),
-                        meetingId
-                    }]);
-                });
             })
             .catch(err => {
                 console.error("SignalR Connection Error:", err);
@@ -363,18 +352,8 @@ const VideoChat = () => {
                         }
                     ]);
                 } else {
-                    // Send group message
+                    // Send group message - don't add locally, it will come back via ReceiveGroupMessage
                     await connection.invoke("SendGroupMessage", meetingId, message, userId);
-                    setMessages(prevMessages => [
-                        ...prevMessages, 
-                        { 
-                            type: "group",
-                            sender: userId, 
-                            msg: message, 
-                            timestamp: new Date(),
-                            meetingId
-                        }
-                    ]);
                 }
                 setMessage("");
             } catch (err) {
@@ -684,6 +663,9 @@ const VideoChat = () => {
                                     placeholder={`Type a ${chatType === "private" && selectedUser ? "private" : "group"} message...`}
                                     className="w-full p-4 pl-5 pr-12 border border-gray-200 dark:border-gray-700 rounded-full shadow-sm focus:border-blue-500 focus:ring focus:ring-blue-200 focus:ring-opacity-50 bg-white dark:bg-gray-800 text-gray-800 dark:text-white"
                                 />
+                                <div className="absolute left-4 top-0 transform -translate-y-1/2 px-2 text-xs font-medium rounded-full" style={{backgroundColor: chatType === "private" ? "#e879f9" : "#60a5fa", color: "white"}}>
+                                    {chatType === "private" && selectedUser ? `Private: ${selectedUser}` : "Group Chat"}
+                                </div>
                                 {message.trim() && (
                                     <button 
                                         onClick={sendMessage}
@@ -704,6 +686,10 @@ const VideoChat = () => {
                     <div className="flex items-center justify-between mb-3">
                         <h3 className="font-semibold text-gray-800 dark:text-white">Online Users</h3>
                         <div className="text-xs text-gray-500 dark:text-gray-400">{users.length} online</div>
+                    </div>
+                    
+                    <div className="text-xs text-gray-500 dark:text-gray-400 mb-2 bg-blue-50 dark:bg-blue-900/30 p-2 rounded">
+                        Click on a user to start a private chat
                     </div>
                     
                     <div className="space-y-2 max-h-80 overflow-y-auto">
